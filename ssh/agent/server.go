@@ -5,6 +5,7 @@
 package agent
 
 import (
+	"context"
 	"crypto/dsa"
 	"crypto/ecdsa"
 	"crypto/ed25519"
@@ -23,7 +24,8 @@ import (
 // server wraps an Agent and uses it to implement the agent side of
 // the SSH-agent, wire protocol.
 type server struct {
-	agent Agent
+	agent ContextAgent
+	ctx   context.Context
 }
 
 func (s *server) processRequestBytes(reqData []byte) []byte {
@@ -92,10 +94,10 @@ func (s *server) processRequest(data []byte) (interface{}, error) {
 			return nil, err
 		}
 
-		return nil, s.agent.Remove(&Key{Format: wk.Format, Blob: req.KeyBlob})
+		return nil, s.agent.Remove(s.ctx, &Key{Format: wk.Format, Blob: req.KeyBlob})
 
 	case agentRemoveAllIdentities:
-		return nil, s.agent.RemoveAll()
+		return nil, s.agent.RemoveAll(s.ctx)
 
 	case agentLock:
 		var req agentLockMsg
@@ -103,14 +105,14 @@ func (s *server) processRequest(data []byte) (interface{}, error) {
 			return nil, err
 		}
 
-		return nil, s.agent.Lock(req.Passphrase)
+		return nil, s.agent.Lock(s.ctx, req.Passphrase)
 
 	case agentUnlock:
 		var req agentUnlockMsg
 		if err := ssh.Unmarshal(data, &req); err != nil {
 			return nil, err
 		}
-		return nil, s.agent.Unlock(req.Passphrase)
+		return nil, s.agent.Unlock(s.ctx, req.Passphrase)
 
 	case agentSignRequest:
 		var req signRequestAgentMsg
@@ -128,13 +130,7 @@ func (s *server) processRequest(data []byte) (interface{}, error) {
 			Blob:   req.KeyBlob,
 		}
 
-		var sig *ssh.Signature
-		var err error
-		if extendedAgent, ok := s.agent.(ExtendedAgent); ok {
-			sig, err = extendedAgent.SignWithFlags(k, req.Data, SignatureFlags(req.Flags))
-		} else {
-			sig, err = s.agent.Sign(k, req.Data)
-		}
+		sig, err := s.agent.Sign(s.ctx, k, req.Data, SignatureFlags(req.Flags))
 
 		if err != nil {
 			return nil, err
@@ -142,7 +138,7 @@ func (s *server) processRequest(data []byte) (interface{}, error) {
 		return &signResponseAgentMsg{SigBlob: ssh.Marshal(sig)}, nil
 
 	case agentRequestIdentities:
-		keys, err := s.agent.List()
+		keys, err := s.agent.List(s.ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -164,33 +160,27 @@ func (s *server) processRequest(data []byte) (interface{}, error) {
 			Rest []byte `ssh:"rest"`
 		}
 
-		if extendedAgent, ok := s.agent.(ExtendedAgent); !ok {
-			// If this agent doesn't implement extensions, [PROTOCOL.agent] section 4.7
-			// requires that we return a standard SSH_AGENT_FAILURE message.
-			responseStub.Rest = []byte{agentFailure}
-		} else {
-			var req extensionAgentMsg
-			if err := ssh.Unmarshal(data, &req); err != nil {
-				return nil, err
-			}
-			res, err := extendedAgent.Extension(req.ExtensionType, req.Contents)
-			if err != nil {
-				// If agent extensions are unsupported, return a standard SSH_AGENT_FAILURE
-				// message as required by [PROTOCOL.agent] section 4.7.
-				if err == ErrExtensionUnsupported {
-					responseStub.Rest = []byte{agentFailure}
-				} else {
-					// As the result of any other error processing an extension request,
-					// [PROTOCOL.agent] section 4.7 requires that we return a
-					// SSH_AGENT_EXTENSION_FAILURE code.
-					responseStub.Rest = []byte{agentExtensionFailure}
-				}
+		var req extensionAgentMsg
+		if err := ssh.Unmarshal(data, &req); err != nil {
+			return nil, err
+		}
+		res, err := s.agent.Extension(s.ctx, req.ExtensionType, req.Contents)
+		if err != nil {
+			// If agent extensions are unsupported, return a standard SSH_AGENT_FAILURE
+			// message as required by [PROTOCOL.agent] section 4.7.
+			if err == ErrExtensionUnsupported {
+				responseStub.Rest = []byte{agentFailure}
 			} else {
-				if len(res) == 0 {
-					return nil, nil
-				}
-				responseStub.Rest = res
+				// As the result of any other error processing an extension request,
+				// [PROTOCOL.agent] section 4.7 requires that we return a
+				// SSH_AGENT_EXTENSION_FAILURE code.
+				responseStub.Rest = []byte{agentExtensionFailure}
 			}
+		} else {
+			if len(res) == 0 {
+				return nil, nil
+			}
+			responseStub.Rest = res
 		}
 
 		return responseStub, nil
@@ -527,13 +517,25 @@ func (s *server) insertIdentity(req []byte) error {
 	if err != nil {
 		return err
 	}
-	return s.agent.Add(*addedKey)
+	return s.agent.Add(s.ctx, *addedKey)
 }
 
 // ServeAgent serves the agent protocol on the given connection. It
 // returns when an I/O error occurs.
-func ServeAgent(agent Agent, c io.ReadWriter) error {
-	s := &server{agent}
+func ServeAgent(agent interface{}, c io.ReadWriter) error {
+
+	var s *server
+	if ctxagent, ok := agent.(ContextAgent); ok {
+		s = &server{
+			ctxagent,
+			ctxagent.InitContext(context.TODO()),
+		}
+	} else {
+		s = &server{
+			&ctxAgentWrapper{agent.(Agent)},
+			context.TODO(),
+		}
+	}
 
 	var length [4]byte
 	for {
@@ -566,5 +568,50 @@ func ServeAgent(agent Agent, c io.ReadWriter) error {
 		if _, err := c.Write(repData); err != nil {
 			return err
 		}
+	}
+}
+
+type ctxAgentWrapper struct {
+	agent Agent
+}
+
+func (wrap *ctxAgentWrapper) InitContext(ctx context.Context) context.Context {
+	return nil
+}
+func (wrap *ctxAgentWrapper) List(ctx context.Context) ([]*Key, error) {
+	return wrap.agent.List()
+}
+func (wrap *ctxAgentWrapper) Add(ctx context.Context, key AddedKey) error {
+	return wrap.agent.Add(key)
+}
+func (wrap *ctxAgentWrapper) Remove(ctx context.Context, key ssh.PublicKey) error {
+	return wrap.agent.Remove(key)
+}
+func (wrap *ctxAgentWrapper) RemoveAll(ctx context.Context) error {
+	return wrap.agent.RemoveAll()
+}
+func (wrap *ctxAgentWrapper) Lock(ctx context.Context, passphrase []byte) error {
+	return wrap.agent.Lock(passphrase)
+}
+func (wrap *ctxAgentWrapper) Unlock(ctx context.Context, passphrase []byte) error {
+	return wrap.agent.Unlock(passphrase)
+}
+func (wrap *ctxAgentWrapper) Signers(ctx context.Context) ([]ssh.Signer, error) {
+	return wrap.agent.Signers()
+}
+func (wrap *ctxAgentWrapper) Sign(ctx context.Context, key ssh.PublicKey, data []byte, flags SignatureFlags) (*ssh.Signature, error) {
+	if extendedAgent, ok := wrap.agent.(ExtendedAgent); ok {
+		return extendedAgent.SignWithFlags(key, data, flags)
+	} else {
+		return wrap.agent.Sign(key, data)
+	}
+}
+func (wrap *ctxAgentWrapper) Extension(ctx context.Context, extensionType string, contents []byte) ([]byte, error) {
+	if extendedAgent, ok := wrap.agent.(ExtendedAgent); ok {
+		return extendedAgent.Extension(extensionType, contents)
+	} else {
+		// If this agent doesn't implement extensions, [PROTOCOL.agent] section 4.7
+		// requires that we return a standard SSH_AGENT_FAILURE message.
+		return []byte{agentFailure}, nil
 	}
 }

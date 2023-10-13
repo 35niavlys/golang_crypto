@@ -14,6 +14,7 @@ package agent // import "golang.org/x/crypto/ssh/agent"
 
 import (
 	"bytes"
+	"context"
 	"crypto/dsa"
 	"crypto/ecdsa"
 	"crypto/ed25519"
@@ -87,6 +88,19 @@ type ExtendedAgent interface {
 	// of the response are unspecified (including the type of the message), the complete
 	// response will be returned as a []byte slice, including the "type" byte of the message.
 	Extension(extensionType string, contents []byte) ([]byte, error)
+}
+
+type ContextAgent interface {
+	InitContext(ctx context.Context) context.Context
+	List(ctx context.Context) ([]*Key, error)
+	Add(ctx context.Context, key AddedKey) error
+	Remove(ctx context.Context, key ssh.PublicKey) error
+	RemoveAll(ctx context.Context) error
+	Lock(ctx context.Context, passphrase []byte) error
+	Unlock(ctx context.Context, passphrase []byte) error
+	Signers(ctx context.Context) ([]ssh.Signer, error)
+	Sign(ctx context.Context, key ssh.PublicKey, data []byte, flags SignatureFlags) (*ssh.Signature, error)
+	Extension(ctx context.Context, extensionType string, contents []byte) ([]byte, error)
 }
 
 // ConstraintExtension describes an optional constraint defined by users.

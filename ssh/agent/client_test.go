@@ -502,7 +502,7 @@ func testAgentLifetime(t *testing.T, agent Agent) {
 }
 
 type keyringExtended struct {
-	*keyring
+	*legacyKeyring
 }
 
 func (r *keyringExtended) Extension(extensionType string, contents []byte) ([]byte, error) {
